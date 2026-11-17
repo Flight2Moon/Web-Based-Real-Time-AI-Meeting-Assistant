@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Meeting Assistant — 실시간 회의 전사·번역·회의록</title>
+  <meta name="description" content="브라우저에서 동작하는 로컬 우선 실시간 회의 전사, 번역, AI 회의록 도구" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Crect width=%2716%27 height=%2716%27 fill=%27%23111%27/%3E%3Crect x=%274%27 y=%274%27 width=%278%27 height=%278%27 fill=%27%23b38b6d%27/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/src/ui.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">Meeting Assistant</div>
+    <div class="status"><span id="dot" class="dot"></span><span id="state">대기</span></div>
+    <div class="spacer"></div>
+    <span id="env" class="mono muted"></span>
+    <button id="btn-settings" class="ghost" data-icon="settings">설정</button>
+  </header>
+
+  <aside class="side">
+    <button id="btn-new" class="primary" data-icon="plus">새 회의</button>
+    <div class="label">저장된 회의</div>
+    <ul id="meetings" class="meetings"></ul>
+    <p class="muted small">회의 데이터는 이 브라우저(IndexedDB)에만 저장됩니다.</p>
+  </aside>
+
+  <main>
+    <section id="setup" class="panel">
+      <h1>새 회의</h1>
+      <div class="grid4">
+        <label>음성 언어
+          <select id="sel-lang"><option value="auto">자동 (English / 한국어)</option><option value="en">English</option><option value="ko">한국어</option></select>
+        </label>
+        <label>번역
+          <select id="sel-tgt"><option value="">사용 안 함</option><option value="ko">한국어로</option><option value="en">English로</option></select>
+        </label>
+        <label>인식 모델
+          <select id="sel-model">
+            <option value="onnx-community/whisper-tiny">Whisper tiny · 빠름</option>
+            <option value="onnx-community/whisper-base" selected>Whisper base · 권장</option>
+            <option value="onnx-community/whisper-small">Whisper small · 정확</option>
+          </select>
+        </label>
+        <label>연산 장치
+          <select id="sel-device"><option value="auto">자동</option><option value="wasm">CPU (WASM)</option><option value="webgpu">GPU (WebGPU)</option></select>
+        </label>
+      </div>
+      <label class="check"><input type="checkbox" id="chk-mic" /> 내 마이크도 함께 전사</label>
+      <div class="actions">
+        <button id="btn-capture" class="primary" data-icon="monitor">회의 탭/창 선택 후 시작</button>
+        <button id="btn-mic" class="ghost" data-icon="mic">마이크만으로 시작</button>
+        <button id="btn-file" class="ghost" data-icon="file">녹음 파일 전사</button>
+        <button id="btn-preload" class="ghost" data-icon="download">모델 미리 준비</button>
+        <input type="file" id="file" accept="audio/*,video/*" hidden />
+      </div>
+      <p id="support" class="notice" hidden></p>
+      <p class="muted small">음성 인식과 번역은 이 기기에서 처리되며 오디오는 서버로 전송되지 않습니다. 회의를 전사하기 전에 참가자에게 알리고 동의를 받으세요.</p>
+    </section>
+
+    <section id="live" class="panel bar" hidden>
+      <video id="preview" muted playsinline></video>
+      <div class="bar-info">
+        <input id="title" class="title" aria-label="회의 제목" />
+        <div id="live-meta" class="mono muted"></div>
+      </div>
+      <button id="btn-pause" class="ghost" data-icon="pause">일시정지</button>
+      <button id="btn-source" class="ghost" data-icon="monitor">소스 변경</button>
+      <button id="btn-stop" class="primary" data-icon="square">종료</button>
+    </section>
+
+    <div id="progress" class="progress" hidden><div id="progress-bar"></div><span id="progress-text" class="mono"></span></div>
+    <p id="error" class="error" role="alert" hidden></p>
+
+    <section id="meeting" hidden>
+      <nav class="tabs">
+        <button data-tab="transcript" class="active">전사</button>
+        <button data-tab="minutes">회의록</button>
+        <div class="spacer"></div>
+        <label class="search" data-icon="search"><input id="search" type="search" placeholder="전사 검색" aria-label="전사 검색" /></label>
+        <button class="ghost" data-export="txt">TXT</button>
+        <button class="ghost" data-export="md">MD</button>
+        <button class="ghost" data-export="srt">SRT</button>
+        <button class="ghost" data-export="json">JSON</button>
+        <button class="ghost" id="btn-print">PDF</button>
+        <button class="ghost danger" id="btn-delete" data-icon="trash">삭제</button>
+      </nav>
+      <div id="tab-transcript" class="printable">
+        <div id="rows" class="rows"></div>
+        <div id="interim" class="row interim" hidden><span class="ts mono"></span><div class="orig"></div><div class="tr"></div></div>
+        <p id="empty" class="muted">아직 전사된 발화가 없습니다.</p>
+      </div>
+      <div id="tab-minutes" class="printable" hidden>
+        <div class="actions">
+          <label class="inline">회의록 언어 <select id="sel-minlang"><option value="ko">한국어</option><option value="en">English</option></select></label>
+          <button id="btn-minutes" class="primary">AI 회의록 생성</button>
+        </div>
+        <p class="muted small">생성 시 이 회의의 전사 텍스트(오디오 제외)가 사용자의 API 키로 Google Gemini API에 전송됩니다.</p>
+        <article id="minutes"></article>
+      </div>
+    </section>
+
+    <details class="metrics">
+      <summary class="label">성능 측정</summary>
+      <dl id="metrics" class="mono"></dl>
+    </details>
+  </main>
+
+  <dialog id="dlg">
+    <form method="dialog">
+      <h2>설정</h2>
+      <label>Google AI Studio (Gemini) API 키
+        <input id="key" type="password" autocomplete="off" placeholder="AIza..." />
+      </label>
+      <label class="check"><input type="checkbox" id="remember" /> 이 브라우저에 키 저장 (끄면 탭을 닫을 때 삭제)</label>
+      <p class="muted small">키는 회의록 생성 시 Google API 호출에만 사용되며 이 브라우저 밖 다른 곳으로 전송되지 않습니다. 브라우저에 저장된 키는 이 기기의 다른 사용자나 확장 프로그램이 읽을 수 있으므로 공용 PC에서는 저장하지 마세요.</p>
+      <label>Gemini 모델
+        <input id="gmodel" list="gmodels" /><datalist id="gmodels"></datalist>
+      </label>
+      <button type="button" id="btn-models" class="ghost">키 확인 및 모델 목록 불러오기</button>
+      <p id="key-status" class="small"></p>
+      <label><span>용어집 (한 줄에 하나. <code>오인식 =&gt; 교정</code> 형식은 전사에 자동 적용)</span>
+        <textarea id="glossary" rows="5" placeholder="WebGPU&#10;지헌&#10;웹 지피유 => WebGPU"></textarea>
+      </label>
+      <label><span>음성 감지 민감도 (낮을수록 작은 소리도 발화로 인식) <span id="thr-val" class="mono"></span></span>
+        <input id="thr" type="range" min="0.002" max="0.05" step="0.001" />
+      </label>
+      <div class="actions"><button class="primary">저장</button></div>
+    </form>
+  </dialog>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
