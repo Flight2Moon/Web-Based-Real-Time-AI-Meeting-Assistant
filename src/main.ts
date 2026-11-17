@@ -3,6 +3,7 @@ import { CaptureError, canCaptureDisplayAudio, captureDisplay, captureMic } from
 import { DEFAULT_OPTS, Segmenter, rms, type AudioSegment } from './audio/segmenter';
 import { AsrClient } from './asr/client';
 import { createTranslator } from './translate';
+import { ContextRefiner, sentenceChain } from './translate/context';
 import { DEFAULT_MODEL, generateMinutes, listModels } from './minutes/gemini';
 import { db } from './storage/db';
 import { applyGlossary, fmtTime, minutesToMarkdown, toJson, toMarkdown, toSrt, toTxt } from './export/formats';
@@ -36,7 +37,7 @@ document.querySelectorAll<HTMLElement>('[data-icon]').forEach((el) => setIcon(el
 
 // ---------- settings ----------
 const KEY = 'ma-gemini-key';
-const settings = { lang: 'auto', tgt: '', model: 'onnx-community/whisper-base', device: 'auto', mic: false, gmodel: DEFAULT_MODEL, glossary: '', threshold: DEFAULT_OPTS.threshold, minLang: 'ko', ...JSON.parse(localStorage.getItem('ma-settings') ?? '{}') };
+const settings = { lang: 'auto', tgt: '', model: 'onnx-community/whisper-base', device: 'auto', mic: false, refine: false, gmodel: DEFAULT_MODEL, glossary: '', threshold: DEFAULT_OPTS.threshold, minLang: 'ko', ...JSON.parse(localStorage.getItem('ma-settings') ?? '{}') };
 const saveSettings = () => localStorage.setItem('ma-settings', JSON.stringify(settings));
 const getKey = () => sessionStorage.getItem(KEY) ?? localStorage.getItem(KEY) ?? '';
 const bind = (id: string, k: keyof typeof settings) => {
@@ -44,7 +45,7 @@ const bind = (id: string, k: keyof typeof settings) => {
   if (el.type === 'checkbox') el.checked = settings[k]; else el.value = settings[k];
   el.addEventListener('change', () => { settings[k] = el.type === 'checkbox' ? el.checked : el.value; saveSettings(); });
 };
-bind('sel-lang', 'lang'); bind('sel-tgt', 'tgt'); bind('sel-model', 'model'); bind('sel-device', 'device'); bind('chk-mic', 'mic'); bind('sel-minlang', 'minLang');
+bind('sel-lang', 'lang'); bind('sel-tgt', 'tgt'); bind('sel-model', 'model'); bind('sel-device', 'device'); bind('chk-mic', 'mic'); bind('chk-refine', 'refine'); bind('sel-minlang', 'minLang');
 
 // ---------- state ----------
 const translator = createTranslator();
@@ -54,7 +55,8 @@ let pipeline: AudioPipeline | null = null, seg = new Segmenter();
 let meeting: Meeting | null = null, segments: Segment[] = [];
 let live = false, paused = false, pending = 0, utterance = 0, audioSec = 0, level = 0, lastLoud = 0;
 let display: MediaStream | null = null, mic: MediaStream | null = null, fileEl: HTMLAudioElement | null = null;
-const metrics = { device: '-', modelLoadMs: 0, asrMs: 0, asrMsSum: 0, audioSecSum: 0, latMs: 0, latSum: 0, n: 0, trMs: 0, trSum: 0, trN: 0, mem: 0 };
+let refiner: ContextRefiner | null = null;
+const metrics = { refMs: 0, refN: 0, device: '-', modelLoadMs: 0, asrMs: 0, asrMsSum: 0, audioSecSum: 0, latMs: 0, latSum: 0, n: 0, trMs: 0, trSum: 0, trN: 0, mem: 0 };
 
 const showError = (msg: string) => { $('error').textContent = msg; $('error').hidden = !msg; };
 const setProgress = (fraction: number | null, text = '') => {
@@ -111,6 +113,9 @@ function attachDisplay(stream: MediaStream) {
 
 async function start(kind: 'display' | 'mic' | 'file', src?: File | string) {
   showError('');
+  const refine = !!settings.tgt && settings.refine;
+  if (refine && !getKey()) { showError('문맥 번역에는 Gemini API 키가 필요합니다. 설정에서 입력하거나 문맥 번역을 끄세요.'); return $<HTMLDialogElement>('dlg').showModal(); }
+  if (settings.tgt && !translator && !refine) return showError('이 브라우저에는 온디바이스 번역이 없습니다. "문맥 번역"(Gemini)을 켜거나 번역을 끄세요.');
   try {
     // Translator first: creating it needs the click's user activation, which getDisplayMedia consumes.
     const sources = settings.lang === 'auto' ? CANDIDATES : [settings.lang];
@@ -133,6 +138,12 @@ async function start(kind: 'display' | 'mic' | 'file', src?: File | string) {
     }
     meeting = { id: crypto.randomUUID(), title: `회의 ${new Date().toLocaleString()}`, createdAt: Date.now(), durationSec: 0 };
     segments = []; audioSec = 0; paused = false; live = true; lastLoud = performance.now();
+    const mine = segments; // this meeting's transcript, even if another meeting is opened later
+    refiner = refine ? new ContextRefiner({
+      key: getKey, model: () => settings.gmodel || DEFAULT_MODEL, glossary: () => settings.glossary, target: settings.tgt, all: () => mine,
+      onResult: (s, t, ms) => { metrics.refMs = ms; metrics.refN++; s.refined = true; setTranslation(s, t); },
+      onError: (e) => showError(`문맥 번역: ${e.message} 기기 내 번역은 계속됩니다.`),
+    }) : null;
     await db.putMeeting(meeting);
     openMeetingView();
     render();
@@ -170,21 +181,38 @@ async function finalize(s: AudioSegment) {
     segments.push(sg);
     addRow(sg, true);
     await db.putSegment(sg);
-    if (settings.tgt && translator && sg.lang !== settings.tgt) {
-      const t0 = performance.now();
-      translator.translate(sg.text, sg.lang, settings.tgt).then(async (t) => { // not awaited: never blocks transcription
-        metrics.trMs = performance.now() - t0; metrics.trSum += metrics.trMs; metrics.trN++;
-        sg.translation = t;
-        await db.putSegment(sg);
-        document.querySelector(`.row[data-idx="${sg.idx}"] .tr`)!.textContent = t;
-      }).catch((e) => showError(`번역 실패: ${e.message}`));
-    }
+    if (settings.tgt) translateSegment(sg, settings.tgt);
   } catch (e) {
     showError(`전사 오류: ${(e as Error).message}`);
   } finally {
     pending--;
     if (!live && !pending) render();
   }
+}
+
+
+// ---------- translation ----------
+async function setTranslation(s: Segment, t: string) {
+  s.translation = t;
+  await db.putSegment(s);
+  const cell = document.querySelector(`.row[data-idx="${s.idx}"] .tr`);
+  if (cell && s.meetingId === meeting?.id) cell.textContent = t;
+}
+
+// Never awaited by the transcription path. Stage 1 (on-device, instant): translate the utterance together with
+// the unfinished sentence it continues. Stage 2 (optional, Gemini): refine with conversation context.
+function translateSegment(sg: Segment, tgt: string) {
+  if (translator && sg.lang !== tgt) {
+    const chain = sentenceChain(segments, segments.indexOf(sg));
+    const t0 = performance.now();
+    translator.translate(chain.map((s) => s.text).join(' '), sg.lang, tgt).then(async (t) => {
+      metrics.trMs = performance.now() - t0; metrics.trSum += metrics.trMs; metrics.trN++;
+      if (sg.refined) return; // the contextual result already arrived
+      for (const p of chain.slice(0, -1)) if (!p.refined) await setTranslation(p, ''); // merged into the row below
+      await setTranslation(sg, t);
+    }).catch((e) => showError(`번역 실패: ${e.message}`));
+  }
+  if (sg.lang !== tgt) refiner?.add(sg); // same-language utterances still serve as context
 }
 
 // Interim captions: only when the recognizer has spare capacity.
@@ -313,6 +341,7 @@ setInterval(() => {
     ['Real-Time Factor (평균)', avg(metrics.asrMsSum / 1000, metrics.audioSecSum).toFixed(3)],
     ['발화 종료→자막 (최근/평균)', `${metrics.latMs.toFixed(0)} / ${avg(metrics.latSum, metrics.n).toFixed(0)} ms`],
     ['번역 (최근/평균)', `${metrics.trMs.toFixed(0)} / ${avg(metrics.trSum, metrics.trN).toFixed(0)} ms`],
+    ['문맥 번역 (최근 · 횟수)', `${metrics.refMs.toFixed(0)} ms · ${metrics.refN}`],
     ['오디오 대기열', `${asr?.backlogSec.toFixed(1) ?? '0.0'} s`],
     ['메모리', metrics.mem ? `${(metrics.mem / 1e6).toFixed(0)} MB` : `${(((performance as any).memory?.usedJSHeapSize ?? 0) / 1e6).toFixed(0)} MB (JS heap)`],
   ];
@@ -443,10 +472,7 @@ if (!canCaptureDisplayAudio()) {
   $<HTMLButtonElement>('btn-capture').disabled = true;
   notes.push('이 브라우저는 탭/창 오디오 캡처를 지원하지 않습니다. 데스크톱 Chrome 또는 Edge에서 열거나, 마이크·녹음 파일 전사를 사용하세요.');
 }
-if (!translator) {
-  $<HTMLSelectElement>('sel-tgt').disabled = true; settings.tgt = ''; $<HTMLSelectElement>('sel-tgt').value = '';
-  notes.push('이 브라우저에는 온디바이스 번역(Translator API, Chrome/Edge 138+ 데스크톱)이 없어 번역을 사용할 수 없습니다.');
-}
+if (!translator) notes.push('이 브라우저에는 온디바이스 번역(Translator API, Chrome/Edge 138+ 데스크톱)이 없습니다. 번역하려면 "문맥 번역"(Gemini)을 켜세요.');
 $('support').textContent = notes.join('\n'); $('support').hidden = !notes.length;
 $('env').textContent = `${crossOriginIsolated ? 'multi-thread' : 'single-thread'} · WebGPU ${'gpu' in navigator ? 'available' : 'n/a'}`;
 render();

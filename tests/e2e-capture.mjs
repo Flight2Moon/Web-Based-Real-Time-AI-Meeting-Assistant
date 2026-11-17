@@ -20,6 +20,20 @@ try {
   await app.waitForFunction(() => crossOriginIsolated, { timeout: 15000, polling: 500 }).catch(() => {}); // static hosts: service worker reloads once
   await app.bringToFront();
   console.log('env:', await app.evaluate(() => ({ isolated: crossOriginIsolated, webgpu: 'gpu' in navigator, translator: 'Translator' in self, ua: navigator.userAgent.match(/Chrome\/[\d.]+/)[0] })));
+  if (process.env.MOCK_GEMINI) { // exercise the contextual-translation plumbing without a real key: canned Gemini replies
+    await app.evaluate(() => { sessionStorage.setItem('ma-gemini-key', 'test-key'); const c = document.getElementById('chk-refine'); c.checked = true; c.dispatchEvent(new Event('change')); });
+    await app.setRequestInterception(true);
+    app.on('request', (r) => {
+      if (!r.url().includes('generativelanguage.googleapis.com')) return r.continue();
+      const headers = { 'access-control-allow-origin': '*', 'access-control-allow-headers': '*' };
+      if (r.method() === 'OPTIONS') return r.respond({ status: 204, headers });
+      const user = JSON.parse(r.postData()).contents[0].parts[0].text;
+      const items = [...user.split('Translate these utterances:')[1].matchAll(/^#(\d+) (.*)$/gm)];
+      console.log(`[mock gemini] batch of ${items.length}, context ${user.includes('context only') ? 'yes' : 'no'}`);
+      const out = items.map((m) => ({ idx: +m[1], translation: `[CTX] ${m[2].slice(0, 30)}` }));
+      r.respond({ status: 200, headers, contentType: 'application/json', body: JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(out) }] } }] }) });
+    });
+  }
   for (const [id, v] of [['sel-device', device], ['sel-model', model], ['sel-tgt', tgt], ['sel-lang', 'auto']])
     await app.evaluate((id, v) => { const s = document.getElementById(id); s.value = v; s.dispatchEvent(new Event('change')); }, id, v);
   // Test-only: don't blast the sample speech through the speakers while it is being captured.
@@ -28,7 +42,7 @@ try {
   const t0 = Date.now();
   await app.waitForFunction(() => document.querySelectorAll('#rows .row').length >= 6 || !document.getElementById('error').hidden, { timeout: 240000, polling: 1000 }) // timer polling: the app tab is in the background while the captured tab has focus
     .catch(async () => console.log('TIMEOUT. state:', await app.$eval('#state', (e) => e.textContent), await app.$eval('#live-meta', (e) => e.textContent), await app.$eval('#progress-text', (e) => e.textContent)));
-  await new Promise((r) => setTimeout(r, 4000));
+  await new Promise((r) => setTimeout(r, process.env.MOCK_GEMINI ? 9000 : 4000));
   console.log('error banner:', JSON.stringify(await app.$eval('#error', (e) => e.textContent)));
   console.log('rows after', ((Date.now() - t0) / 1000).toFixed(0), 's:');
   for (const r of await app.$$eval('#rows .row', (rs) => rs.map((r) => [...r.children].map((c) => c.textContent).join(' | ')))) console.log('  ', r);

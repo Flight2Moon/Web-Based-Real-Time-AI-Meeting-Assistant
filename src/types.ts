@@ -18,6 +18,7 @@ export interface Segment {
   lang: string;
   text: string;
   translation?: string;
+  refined?: boolean; // translation came from the contextual (Gemini) pass
 }
 
 interface Cited { evidence: number[] }

@@ -23,7 +23,7 @@ async function call(path: string, key: string, body?: unknown) {
   const json = await res.json().catch(() => ({}));
   if (res.ok) return json;
   const msg = json.error?.message ?? res.statusText;
-  if (res.status === 429) throw new GeminiError(`API 사용량 한도를 초과했습니다. 잠시 후 다시 시도하세요. (${msg})`);
+  if (res.status === 429) throw Object.assign(new GeminiError(`API 사용량 한도를 초과했습니다. 잠시 후 다시 시도하세요. (${msg})`), { rateLimited: true });
   if (res.status === 400 && /API key/i.test(msg) || res.status === 401 || res.status === 403) throw new GeminiError(`API 키가 올바르지 않거나 권한이 없습니다. (${msg})`);
   if (res.status === 404) throw new GeminiError(`모델을 찾을 수 없습니다. 설정에서 모델 이름을 확인하세요. (${msg})`);
   throw new GeminiError(`Gemini API 오류 ${res.status}: ${msg}`);
@@ -77,16 +77,18 @@ export function chunkSegments(segs: Segment[], maxChars = MAX_CHARS): Segment[][
   return out;
 }
 
-async function generate(key: string, model: string, system: string, user: string) {
+/** One JSON-mode generateContent call. Shared by minutes and contextual translation. */
+export async function generateJson(key: string, model: string, system: string, user: string, schema: unknown) {
   const j = await call(`models/${model}:generateContent`, key, {
     systemInstruction: { parts: [{ text: system }] },
     contents: [{ role: 'user', parts: [{ text: user }] }],
-    generationConfig: { temperature: 0.2, responseMimeType: 'application/json', responseSchema: SCHEMA },
+    generationConfig: { temperature: 0.2, responseMimeType: 'application/json', responseSchema: schema },
   });
   const text = j.candidates?.[0]?.content?.parts?.map((p: any) => p.text ?? '').join('');
   if (!text) throw new GeminiError(`모델이 응답을 생성하지 못했습니다 (${j.candidates?.[0]?.finishReason ?? j.promptFeedback?.blockReason ?? 'empty'}).`);
   try { return JSON.parse(text); } catch { throw new GeminiError('모델 응답을 해석할 수 없습니다. 다시 시도하세요.'); }
 }
+const generate = (key: string, model: string, system: string, user: string) => generateJson(key, model, system, user, SCHEMA);
 
 export async function generateMinutes(
   o: { key: string; model: string; lang: string; glossary: string; meeting: Meeting; segments: Segment[]; onProgress?: (done: number, total: number) => void },
